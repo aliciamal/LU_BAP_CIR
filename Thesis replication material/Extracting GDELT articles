@@ -1,1 +1,332 @@
+library(data.table)
+library(httr)
+library(jsonlite)
+library(rvest)
+
+# ----- Parameters -----
+max_files <- 1200
+batch_size <- 200
+split_size <- 50000  # Rows per output CSV file
+# ----------------------
+
+# Load the master file list
+latest_data <- fread("masterfilelist1.txt", header = FALSE, fill = TRUE)
+
+# Extract GKG file URLs
+gkg_urls <- latest_data$V3[grep("gkg.csv.zip", latest_data$V3)]
+
+# Extract and convert datetime safely
+gkg_info <- data.table(
+  url = gkg_urls,
+  datetime = as.POSIXct(sub("\\.gkg\\.csv\\.zip", "", basename(gkg_urls)),
+                        format = "%Y%m%d%H%M%S", tz = "UTC")
+)
+
+# Remove invalid entries
+gkg_info <- gkg_info[!is.na(datetime)]
+gkg_info <- gkg_info[format(datetime, "%Y") == "2018"]
+gkg_info <- gkg_info[seq(1, .N, by = 32)]  # Roughly one file per day
+
+if (!is.null(max_files)) {
+  gkg_info <- gkg_info[1:min(max_files, .N)]
+}
+
+# Function to filter for MOVEMENT_SOCIAL
+Filter_SC <- function(gkg) {
+  theme <- "MOVEMENT_SOCIAL"
+  cols_to_check <- c("V6", "V7", "V8", "V9")
+  existing_cols <- intersect(cols_to_check, names(gkg))
+  if (length(existing_cols) == 0) return(NULL)
+  
+  row_match <- Reduce(`|`, lapply(existing_cols, function(col) {
+    grepl(theme, gkg[[col]], ignore.case = TRUE)
+  }))
+  return(gkg[row_match])
+}
+
+# Robust download with retry
+download_with_retry <- function(url, destfile, max_tries = 5, delay = 2) {
+  tries <- 0
+  while (tries < max_tries) {
+    tries <- tries + 1
+    try({
+      download.file(url, destfile, quiet = TRUE)
+      if (file.exists(destfile)) return(TRUE)
+    }, silent = TRUE)
+    Sys.sleep(delay)
+  }
+  message("Failed to download after ", max_tries, " tries: ", url)
+  return(FALSE)
+}
+
+# Function to download, unzip, and process a batch
+Unzip <- function(batch_info, batch_num) {
+  download_dir <- paste0("gkg_data_2019_batch_", batch_num)
+  if (dir.exists(download_dir)) unlink(download_dir, recursive = TRUE)
+  dir.create(download_dir)
+  
+  cat("Processing batch", batch_num, "\n")
+  
+  for (i in seq_len(nrow(batch_info))) {
+    url <- batch_info$url[i]
+    dest_zip <- file.path(download_dir, paste0("gkg_", i, ".zip"))
+    
+    cat("Attempting:", url, "\n")
+    success <- download_with_retry(url, dest_zip)
+    if (success) {
+      try(unzip(dest_zip, exdir = download_dir, overwrite = TRUE), silent = TRUE)
+      unlink(dest_zip)
+    } else {
+      cat("Skipping after failed attempts:", url, "\n")
+    }
+    
+    Sys.sleep(1)  # Delay between requests to avoid throttling
+  }
+  
+  gkg_files <- list.files(download_dir, pattern = "\\.gkg\\.csv$", full.names = TRUE)
+  
+  gkg_2019 <- rbindlist(
+    lapply(gkg_files, function(file) {
+      tryCatch(fread(file, sep = "\t", quote = "", header = FALSE, fill = TRUE),
+               error = function(e) NULL)
+    }),
+    use.names = FALSE,
+    fill = TRUE
+  )
+  
+  unlink(gkg_files)  # Clean up unzipped CSVs
+  
+  return(Filter_SC(gkg_2019))
+}
+
+# Process in batches
+final_result <- list()
+total_files <- nrow(gkg_info)
+total_batches <- ceiling(total_files / batch_size)
+
+for (batch_num in 1:total_batches) {
+  start_idx <- (batch_num - 1) * batch_size + 1
+  end_idx <- min(batch_num * batch_size, total_files)
+  batch_info <- gkg_info[start_idx:end_idx]
+  
+  filtered_data <- Unzip(batch_info, batch_num)
+  
+  if (!is.null(filtered_data) && nrow(filtered_data) > 0) {
+    final_result[[length(final_result) + 1]] <- filtered_data
+  }
+  
+  unlink(paste0("gkg_data_2019_batch_", batch_num), recursive = TRUE)
+}
+
+# Combine and save results
+if (length(final_result) > 0) {
+  GKG_Movement <- rbindlist(final_result, use.names = FALSE, fill = TRUE)
+  total_rows <- nrow(GKG_Movement)
+  
+  for (i in seq(1, total_rows, by = split_size)) {
+    chunk <- GKG_Movement[i:min(i + split_size - 1, total_rows)]
+    file_name <- paste0("GKG_Movement_part_", ceiling(i / split_size), ".csv")
+    fwrite(chunk, file_name)
+    cat("Saved:", file_name, "\n")
+  }
+} else {
+  cat("No matching records found.\n")
+}
+
+protest_kg <- fread("GKG_Movement_part_1.csv")
+
+########_____________-------------------------------
+#avoiding cookie consent
+#####_________________________________________________
+library(rvest)
+library(data.table)
+library(httr)
+
+# 1. Read in your dataset
+protest_kg <- fread("GKG_Movement_part_1.csv")
+
+# 2. Extract and clean URLs (assumed in column V5)
+urls <- unique(protest_kg$V5)
+urls <- urls[!is.na(urls) & grepl("^http", urls)]  # remove NAs and malformed entries
+
+# 3. Define robust scraping function
+get_article_text <- function(url, retries = 3) {
+  for (i in seq_len(retries)) {
+    try({
+      res <- GET(url, user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64)"))
+      if (status_code(res) != 200) next  # try again if request fails
+      
+      page <- read_html(res)
+      
+      # Broader selector: article, div, section, p
+      text <- page %>%
+        html_nodes("article, div, section, p") %>%
+        html_text(trim = TRUE)
+      
+      combined_text <- paste(text, collapse = " ")
+      if (nchar(combined_text) > 100) return(combined_text)  # Only return meaningful text
+    }, silent = TRUE)
+    Sys.sleep(runif(1, 1, 3))  # Rate limiting: 1-3 sec pause between retries
+  }
+  return(NA_character_)  # Give up after retries
+}
+
+# 4. Scrape article text (loop to allow sleeping)
+texts <- character(length(urls))
+for (i in seq_along(urls)) {
+  cat("Scraping", i, "of", length(urls), ":", urls[i], "\n")
+  texts[i] <- get_article_text(urls[i])
+}
+
+# 5. Build the dataset
+protest_article_dataset2019 <- data.table(
+  url = urls,
+  text = texts
+)
+
+# 6. Filter out empty or failed scrapes
+article_dataset2019 <- protest_article_dataset2019[
+  !is.na(text) & trimws(text) != ""
+]
+fwrite(article_dataset2019, "article_dataset2018cookies fixed.csv")
+
+#---------------------------------------------------------------------------------------------------------
+#Running LLMS analysis
+#--------------------------------------------------------------------------------------------------------
+closeAllConnections()
+library(httr)
+library(readr)
+library(progress)
+library(data.table)
+library(jsonlite)
+
+#cleaning text
+clean_text <- function(x) {
+  # Replace multiple spaces and tabs but keep newlines
+  x <- gsub("[ \t]+", " ", x)  # normalize horizontal spacing
+  x <- gsub("[\u201C\u201D\u2018\u2019]", "\"", x)
+  x <- gsub("[\u2013\u2014]", "-", x)
+  x <- trimws(x)
+  return(x)
+}
+
+protest_text_articles_dataset <- fread("article_dataset2018cookies fixed.csv")
+protest_text_articles_dataset[, text := lapply(text, clean_text)]
+
+navco_data <- fread("NAVCO_data.csv", encoding = "UTF-8")
+navco_data[, CAMPAIGN := clean_text(CAMPAIGN)]
+campaign_names <- unique(na.omit(navco_data$CAMPAIGN))
+campaign_json <- toJSON(campaign_names, auto_unbox = TRUE)
+
+# ----------------------------
+# API CALL FUNCTION
+# ----------------------------
+send_to_gpt <- function(text, api_key, model = "gpt-4o-mini") {
+  on.exit(closeAllConnections(), add = TRUE)
+  url <- "https://api.openai.com/v1/chat/completions"
+  response <- POST(
+    url = url,
+    add_headers(Authorization = paste("Bearer", api_key)),
+    content_type_json(),
+    encode = "json",
+    body = list(
+      model = model,
+      messages = list(list(role = "user", content = text))
+    )
+  )
+  parsed <- content(response, as = "parsed")
+  if (!is.null(parsed$choices) && length(parsed$choices) > 0) {
+    return(parsed$choices[[1]]$message$content)
+  }
+  return(NULL)
+}
+
+# ----------------------------
+# Detect Campaign Match
+# ----------------------------
+detect_campaign <- function(text) {
+  prompt <- paste(
+    "You are analyzing a news article about a protest or social movement.",
+    "Try to match the article to any of the following NAVCO campaign names:",
+    campaign_json,
+    "",
+    "Return the campaign name exactly as listed, or 'None' if no match.",
+    "",
+    "Campaign Match Only. Article:", text
+  )
+  
+  Sys.sleep(2)
+  response <- tryCatch(send_to_gpt(prompt, api_key), error = function(e) NULL)
+  if (!is.null(response)) {
+    matched <- gsub(".*Campaign:\\s*([^;\\n]+).*", "\\1", response)
+    return(trimws(matched))
+  } else {
+    return(NA)
+  }
+}
+
+# ----------------------------
+# Score Social Control (Only If Campaign Found)
+# ----------------------------
+score_social_control <- function(text) {
+  prompt <- paste(
+    "You are analyzing a news article about a protest or social movement.",
+    "Score the article using this framework:",
+    "- V1: Overall presence of social control (0–1)",
+    "- V2: Level of tolerance toward deviance (0–1)",
+    "- V3: Level of sanctions imposed (0–1)",
+    "- V4: Strength and clarity of social norms (0–1)",
+    "",
+    "Respond in this exact format:",
+    "'V1: [score]; V2: [score]; V3: [score]; V4: [score]'",
+    "\n\nArticle:", text
+  )
+  
+  Sys.sleep(2)
+  response <- tryCatch(send_to_gpt(prompt, api_key), error = function(e) NULL)
+  if (!is.null(response)) {
+    extract <- function(pattern) {
+      val <- sub(pattern, "\\1", response)
+      num <- suppressWarnings(as.numeric(val))
+      if (is.na(num) || num < 0 || num > 1) NA else num
+    }
+    v1 <- extract(".*V1:\\s*([0-9.]+).*")
+    v2 <- extract(".*V2:\\s*([0-9.]+).*")
+    v3 <- extract(".*V3:\\s*([0-9.]+).*")
+    v4 <- extract(".*V4:\\s*([0-9.]+).*")
+    return(list(V1 = v1, V2 = v2, V3 = v3, V4 = v4))
+  } else {
+    return(list(V1 = NA, V2 = NA, V3 = NA, V4 = NA))
+  }
+}
+
+# ----------------------------
+# RUNNing THE FULL ANALYSIS
+# ----------------------------
+api_key <- "add API key"
+clean_dataset <- protest_text_articles_dataset[!is.na(text) & nchar(text) > 50]
+n <- nrow(clean_dataset)
+results <- vector("list", n)
+pb <- progress_bar$new(total = n)
+
+for (i in seq_len(n)) {
+  pb$tick()
+  article_text <- clean_dataset$text[i]
+  
+  campaign <- tryCatch(detect_campaign(article_text), error = function(e) NA)
+  
+  if (!is.na(campaign) && tolower(campaign) != "none") {
+    scores <- tryCatch(score_social_control(article_text), error = function(e) list(V1 = NA, V2 = NA, V3 = NA, V4 = NA))
+  } else {
+    scores <- list(V1 = NA, V2 = NA, V3 = NA, V4 = NA)
+  }
+  
+  results[[i]] <- c(scores, Campaign = campaign)
+}
+
+
+# Combine and save results
+results_dt <- as.data.table(do.call(rbind, results))
+final_clean_dataset <- cbind(clean_dataset, results_dt)
+fwrite(final_clean_dataset, "final_social_control_with_campaigns_separated2018.csv")
 
